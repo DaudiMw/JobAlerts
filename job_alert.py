@@ -44,33 +44,16 @@ HANDSHAKE_PASSWORD = os.getenv("HANDSHAKE_PASSWORD")
 LOCATION     = "Baltimore, MD"
 RADIUS_MILES = 50
 
-# Generalizable Keywords
-# KEYWORDS = [
-#     "software engineer",
-#     "software developer",
-#     "backend engineer",
-#     "frontend engineer",
-#     "full stack engineer",
-#     "data engineer",
-#     "junior developer",
-#     "associate software engineer",
-#     "data scientist",
-#     "AI Engineer",
-# ]
+keywords_env = os.getenv("KEYWORDS", '["software engineer"]') 
 
-KEYWORDS = [
-    "data analyst",
-    "underwriter",
-    "data entry",
-    "admin assistant",
-    "business analyst",
-    "project manager",
-    "project coordinator",
-    "insurance",
-]
+try:
+    KEYWORDS = json.loads(keywords_env)
+except json.JSONDecodeError:
+    log.error("Failed to parse KEYWORDS from environment.")
+    KEYWORDS = ["software engineer"] # Fallback
 
-# Example for other industries:
-# KEYWORDS = ["data analyst", "underwriter", "admin assistant", "project manager"]
+log.info(f"Loaded keywords: {KEYWORDS}")
+
 
 HEADERS = {
     "User-Agent": (
@@ -232,6 +215,7 @@ def fetch_handshake() -> list[dict]:
     try:
         log.info("Handshake: initializing Chrome driver...")
         options = webdriver.ChromeOptions()
+        options.add_argument("--headless")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-gpu")

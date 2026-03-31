@@ -1,0 +1,59 @@
+name: Daily Job Scraper
+
+on:
+  schedule:
+    # Runs at 12:00 UTC (8:00 AM EDT) every day
+    - cron: '0 16 * * *'
+  workflow_dispatch: # Allows you to trigger it manually for testing
+
+jobs:
+  run-scraper:
+    runs-on: ubuntu-latest
+    
+    # This is where the magic happens. It will run this job twice, 
+    # once for Profile A and once for Profile B.
+    strategy:
+      matrix:
+        include:
+          - profile_name: "Tech Jobs for Daudi"
+            recipient: ${{ secrets.EMAIL_A_RECIPIENT }}
+            keywords: '["software engineer","software developer","backend engineer","frontend engineer","full stack engineer","data engineer","junior developer","associate software engineer","data scientist","AI Engineer"]'
+          - profile_name: "Business Jobs for Adi"
+            recipient: ${{ secrets.EMAIL_B_RECIPIENT }}
+            keywords: '["data analyst","underwriter","data entry","admin assistant","business analyst","project manager","project coordinator","insurance"]'
+
+    name: Run for ${{ matrix.profile_name }}
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # Install Chrome for Selenium
+      - name: Setup Chrome
+        uses: browser-actions/setup-chrome@v1
+      
+      - name: Install Dependencies
+        run: |
+          pip install requests beautifulsoup4 selenium webdriver-manager python-dotenv
+
+      - name: Run Scraper Script
+        env:
+          # Pull the dynamic variables from the matrix
+          EMAIL_RECIPIENT: ${{ matrix.recipient }}
+          KEYWORDS: ${{ matrix.keywords }}
+          
+          # Pull your fixed secrets from GitHub Repository Secrets
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
+          ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}
+          USAJOBS_API_KEY: ${{ secrets.USAJOBS_API_KEY }}
+          HANDSHAKE_EMAIL: ${{ secrets.HANDSHAKE_EMAIL }}
+          HANDSHAKE_PASSWORD: ${{ secrets.HANDSHAKE_PASSWORD }}
+          USAJOBS_USER_AGENT: ${{ secrets.USAJOBS_USER_AGENT }}
+        run: python your_script_name.py
