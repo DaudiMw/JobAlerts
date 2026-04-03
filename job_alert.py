@@ -166,46 +166,76 @@ def fetch_adzuna(keyword: str) -> list[dict]:
         log.warning(f"Adzuna fetch failed for '{keyword}': {e}")
     return jobs
 
-def fetch_usajobs() -> list[dict]:
+def fetch_usajobs():
     """USAJobs runs once with a broad query constructed from KEYWORDS."""
+
+    # def get_title(jobitem: dict) -> str:
+    #     return jobitem.get("MatchedObjectDescriptor", {}).get("PositionTitle")
+
+    # def get_company(jobitem: dict) -> str:
+    #     return jobitem.get("MatchedObjectDescriptor", {}).get("OrganizationName")
+    
+    # def get_location(jobitem: dict) -> str:
+    #     return jobitem.get("MatchedObjectDescriptor", {}).get("PositionLocation", {}).get("LocationName")
+
+    # def get_url(jobitem: dict) -> str:
+    #     return jobitem.get("MatchedObjectDescriptor", {}).get("ApplyURI")[0]
+    
     jobs = []
     if not USAJOBS_API_KEY:
         log.warning("USAJobs: Missing API Key.")
         return jobs
     
     # Construct broad query
-    query = " OR ".join(KEYWORDS[:5]) # USAJobs handles limited query length better
-    
-    params = {
-        "Keyword": query,
-        "LocationName": LOCATION,
-        "Radius": RADIUS_MILES,
-        "DatePosted": 1,
-        "ResultsPerPage": 50,
-        "Fields": "Min",
-    }
-    headers = {
-        "Host":              "data.usajobs.gov",
-        "User-Agent":        USAJOBS_USER_AGENT or EMAIL_SENDER or "job_alert_script",
-        "Authorization-Key": USAJOBS_API_KEY.strip(),
-    }
-    try:
-        r = requests.get(f"https://data.usajobs.gov/api/search?{urlencode(params)}", headers=headers, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        for item in data.get("SearchResult", {}).get("SearchResultItems", []):
-            j = item.get("MatchedObjectDescriptor", {})
-            jobs.append({
-                "title":    j.get("PositionTitle", "N/A"),
-                "company":  j.get("OrganizationName", "N/A"),
-                "location": j.get("PositionLocationDisplay", LOCATION),
-                "url":      j.get("PositionURI", "#"),
-                "source":   "USAJobs",
-                "posted":   j.get("PublicationStartDate", "")[:10],
-            })
-        log.info(f"USAJobs returned {len(jobs)} jobs.")
-    except Exception as e:
-        log.warning(f"USAJobs fetch failed: {e}")
+    for query in KEYWORDS:
+        
+        # # API format requires specific headers and parameters
+        params = {
+            "Keyword": query,
+            "SecurityClearanceRequired": 0,
+            "LocationName": LOCATION,
+            "Radius": RADIUS_MILES,
+            "DatePosted": 1,
+            "ResultsPerPage": 50,
+        }
+        
+        # # Add JobCategoryCode for IT/Computer Science if any keyword relates to it
+        # if any(kw in query.lower() for kw in ["software", "developer", "engineer", "data", "computer", "it"]):
+        #     params["JobCategoryCode"] = "2210"
+
+        headers = {
+            "Host": "data.usajobs.gov",
+            "User-Agent": USAJOBS_USER_AGENT or EMAIL_SENDER or "job_alert_script",
+            "Authorization-Key": USAJOBS_API_KEY.strip(),
+        }
+        
+        try:
+            url = "https://data.usajobs.gov/api/search"
+            r = requests.get(url, headers=headers, params=params, timeout=15)
+            r.raise_for_status()
+            
+            data = r.json()
+            # breakpoint()
+            search_result = data.get("SearchResult", {})
+
+            log.info(f"USAJobs found {search_result.get("SearchResultCount", 0)} jobs.")
+
+            items = search_result.get("SearchResultItems", [])
+            
+            for item in items:
+                j = item.get("MatchedObjectDescriptor", {})
+                jobs.append({
+                    "title":    j.get("PositionTitle", "N/A"),
+                    "company":  j.get("OrganizationName", "N/A"),
+                    "location": j.get("PositionLocationDisplay", LOCATION),
+                    "url":      j.get("PositionURI", "#"),
+                    "source":   "USAJobs",
+                    "posted":   j.get("PublicationStartDate", "")[:10],
+                })
+            log.info(f"USAJobs returned {len(jobs)} jobs.")
+        except Exception as e:
+            log.warning(f"USAJobs fetch failed: {e}")
+
     return jobs
 
 def fetch_handshake() -> list[dict]:
@@ -351,6 +381,96 @@ def fetch_indeed(keyword: str) -> list[dict]:
         if driver: driver.quit()
     return jobs
 
+def fetch_mwejobs(keyword: str) -> list[dict]:
+
+
+
+    
+    jobs = []
+    driver = None
+    try:
+        log.info(f"MWEJobs: searching for '{keyword}'...")
+        options = webdriver.ChromeOptions()
+        # options.add_argument("--headless")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument(f"user-agent={HEADERS['User-Agent']}")
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=options)
+        
+        # Using Default.aspx?guest=1 as it matches the provided HTML structure
+        driver.get("https://mwejobs.maryland.gov/vosnet/Default.aspx?plang=E&guest=1")
+        time.sleep(5)
+        
+        wait = WebDriverWait(driver, 20)
+        
+        # Try specific IDs provided by the user first
+        kw_input = None
+        for cid in ["univsearchtxtkeyword", "txtKeyword", "Keywords", "Keyword"]:
+            try:
+                kw_input = driver.find_element(By.ID, cid)
+                if kw_input.is_displayed(): break
+            except: continue
+        
+        if not kw_input:
+            kw_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[id*='Keyword'], input[name*='Keyword']")))
+
+        kw_input.clear()
+        kw_input.send_keys(keyword)
+        
+        # Location input
+        loc_input = None
+        for cid in ["univsearchlocation", "txtLocation", "Location"]:
+            try:
+                loc_input = driver.find_element(By.ID, cid)
+                if loc_input.is_displayed(): break
+            except: continue
+        
+        if not loc_input:
+            loc_input = driver.find_element(By.CSS_SELECTOR, "input[id*='Location'], input[name*='Location']")
+        
+        loc_input.clear()
+        loc_input.send_keys(LOCATION)
+        
+        # Search button
+        search_btn = None
+        for cid in ["univsearchbtn", "btnSearch", "ButtonSearch", "SearchButton"]:
+            try:
+                search_btn = driver.find_element(By.ID, cid)
+                if search_btn.is_displayed(): break
+            except: continue
+        
+        if not search_btn:
+            # Fallback for search button, including <a> tags as seen in HTML
+            search_btn = driver.find_element(By.CSS_SELECTOR, "a[id*='searchbtn'], button[id*='Search'], input[type='submit'][value*='Search']")
+            
+        search_btn.click()
+        
+        # Wait for results page - looking for job title links
+        wait.until(EC.presence_of_element_located((By.XPATH, "//a[contains(@id, 'lnkJobTitle')]")))
+        time.sleep(3) 
+        
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+        for a in soup.find_all("a", id=re.compile(r"lnkJobTitle")):
+            tr = a.find_parent("tr")
+            if tr:
+                tds = tr.find_all("td")
+                if len(tds) >= 3:
+                    jobs.append({
+                        "title":    a.text.strip(),
+                        "company":  tds[2].text.strip() if len(tds) > 2 else "N/A",
+                        "location": tds[3].text.strip() if len(tds) > 3 else LOCATION,
+                        "url":      "https://mwejobs.maryland.gov/vosnet/" + a["href"],
+                        "source":   "MWEJobs",
+                        "posted":   "Recent",
+                    })
+        log.info(f"MWEJobs: found {len(jobs)} jobs for '{keyword}'.")
+    except Exception as e:
+        log.warning(f"MWEJobs fetch failed for '{keyword}': {e}")
+    finally:
+        if driver: driver.quit()
+    return jobs
+
 # ── Logic ─────────────────────────────────────────────────────────────────────
 
 def deduplicate(jobs: list[dict]) -> list[dict]:
@@ -365,22 +485,40 @@ def deduplicate(jobs: list[dict]) -> list[dict]:
 def build_email_html(jobs: list[dict]) -> str:
     by_source: dict[str, list] = {}
     for job in jobs: by_source.setdefault(job["source"], []).append(job)
-    colors = {"LinkedIn": "#0077b5", "Adzuna": "#e8593a", "USAJobs": "#1a3a6e", "Handshake": "#e8734a", "Simplify": "#6366f1", "Indeed": "#2164f3"}
+    colors = {
+        "LinkedIn": "#0077b5", 
+        "Adzuna": "#e8593a", 
+        "USAJobs": "#1a3a6e", 
+        "Handshake": "#e8734a", 
+        "Simplify": "#6366f1", 
+        "Indeed": "#2164f3",
+        "MWEJobs": "#00472f"
+    }
     rows = ""
-    for source, src_jobs in by_source.items():
-        color = colors.get(source, "#555")
-        rows += f"<tr><td colspan='3' style='background:{color};color:#fff;padding:8px 14px;font-weight:bold;'>{source} · {len(src_jobs)} listings</td></tr>"
-        for j in src_jobs:
-            rows += f"<tr><td style='padding:8px 14px;border-bottom:1px solid #eee;'><a href='{j['url']}' style='color:#1a73e8;text-decoration:none;font-weight:600;'>{j['title']}</a></td><td style='padding:8px 14px;border-bottom:1px solid #eee;'>{j['company']}</td><td style='padding:8px 14px;border-bottom:1px solid #eee;font-size:12px;'>{j['location']}<br>{j['posted']}</td></tr>"
-    return f"<html><body style='font-family:Arial;max-width:900px;margin:auto;background:#f4f4f4;padding:20px;'><div style='background:#1a3a6e;padding:20px;border-radius:8px 8px 0 0;color:#fff;'><h1>🎓 New Job Alerts</h1><p>{len(jobs)} relevant listings found near Baltimore</p></div><div style='background:#fff;border:1px solid #ddd;border-radius:0 0 8px 8px;'><table width='100%' cellpadding='0' cellspacing='0'><tbody>{rows}</tbody></table></div></body></html>"
+    
+    if not jobs:
+        rows = "<tr><td colspan='3' style='padding:30px;text-align:center;color:#666;font-size:16px;'>No new job listings found today.</td></tr>"
+        summary_text = "No new listings found near Baltimore"
+    else:
+        summary_text = f"{len(jobs)} relevant listings found near Baltimore"
+        for source, src_jobs in by_source.items():
+            color = colors.get(source, "#555")
+            rows += f"<tr><td colspan='3' style='background:{color};color:#fff;padding:8px 14px;font-weight:bold;'>{source} · {len(src_jobs)} listings</td></tr>"
+            for j in src_jobs:
+                rows += f"<tr><td style='padding:8px 14px;border-bottom:1px solid #eee;'><a href='{j['url']}' style='color:#1a73e8;text-decoration:none;font-weight:600;'>{j['title']}</a></td><td style='padding:8px 14px;border-bottom:1px solid #eee;'>{j['company']}</td><td style='padding:8px 14px;border-bottom:1px solid #eee;font-size:12px;'>{j['location']}<br>{j['posted']}</td></tr>"
+    
+    return f"<html><body style='font-family:Arial;max-width:900px;margin:auto;background:#f4f4f4;padding:20px;'><div style='background:#1a3a6e;padding:20px;border-radius:8px 8px 0 0;color:#fff;'><h1>🎓 New Job Alerts</h1><p>{summary_text}</p></div><div style='background:#fff;border:1px solid #ddd;border-radius:0 0 8px 8px;'><table width='100%' cellpadding='0' cellspacing='0'><tbody>{rows}</tbody></table></div></body></html>"
 
 def send_email(jobs: list[dict]) -> None:
     if not all([EMAIL_SENDER, EMAIL_PASSWORD, EMAIL_RECIPIENT]): return
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"🔔 {len(jobs)} New Job Alerts - {datetime.now().strftime('%b %d %I:%M %p')}"
     msg["From"], msg["To"] = EMAIL_SENDER, EMAIL_RECIPIENT
-    msg.attach(MIMEText("\n".join([f"[{j['source']}] {j['title']} @ {j['company']}" for j in jobs]), "plain"))
+    
+    plain_text = "\n".join([f"[{j['source']}] {j['title']} @ {j['company']}" for j in jobs]) if jobs else "No new jobs found today."
+    msg.attach(MIMEText(plain_text, "plain"))
     msg.attach(MIMEText(build_email_html(jobs), "html"))
+    
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(EMAIL_SENDER, EMAIL_PASSWORD)
         server.sendmail(EMAIL_SENDER, EMAIL_RECIPIENT, msg.as_string())
@@ -410,6 +548,7 @@ def run():
         all_jobs.extend(fetch_linkedin(kw))
         all_jobs.extend(fetch_adzuna(kw))
         all_jobs.extend(fetch_indeed(kw))
+        # all_jobs.extend(fetch_mwejobs(kw))
         time.sleep(2)
 
     unique_jobs = deduplicate(all_jobs)
@@ -419,10 +558,8 @@ def run():
     new_jobs = [j for j in filtered_jobs if j["url"] not in last_urls]
     log.info(f"Summary: {len(all_jobs)} found -> {len(filtered_jobs)} relevant/entry -> {len(new_jobs)} new.")
 
-    if new_jobs:
-        send_email(new_jobs)
-    else:
-        log.info("No new jobs to notify.")
+    # Always send email, even if new_jobs is empty
+    send_email(new_jobs)
 
     with open(out_path, "w") as f:
         json.dump(filtered_jobs, f, indent=2)

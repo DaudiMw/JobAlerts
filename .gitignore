@@ -1,4 +1,5 @@
 .venv/
 chrome_profile_handshake/
 .env
-
+GEMINI.md
+*.pyc
