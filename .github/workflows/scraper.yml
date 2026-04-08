@@ -22,6 +22,10 @@ jobs:
             recipient_secret_name: "EMAIL_B_RECIPIENT"
             keywords: '["data analyst","underwriter","data entry","admin assistant","business analyst","project manager","project coordinator","insurance"]'
 
+          - profile_name: "Tech Jobs for Roscoe"
+            recipient_secret_name: "EMAIL_C_RECIPIENT"
+            keywords: '["software engineer", "data analyst", "IT", "project manager","project coordinator", "software developer","backend engineer","frontend engineer","full stack engineer","data engineer","junior developer","associate software engineer","data scientist","AI Engineer"]'
+
     name: Run for ${{ matrix.profile_name }}
     
     steps:
