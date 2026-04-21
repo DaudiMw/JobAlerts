@@ -15,7 +15,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from urllib.parse import urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -26,6 +26,11 @@ from webdriver_manager.chrome import ChromeDriverManager
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+
+try:
+    from jobspy import scrape_jobs as jobspy_scrape_jobs
+except ImportError:
+    jobspy_scrape_jobs = None
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -77,7 +82,9 @@ SEARCH_LOCATIONS = _load_json_list(
 )
 GREENHOUSE_BOARDS = _load_json_list("GREENHOUSE_BOARDS", [])
 LEVER_SITES = _load_json_list("LEVER_SITES", [])
+JOBSPY_SITES = _load_json_list("JOBSPY_SITES", ["linkedin", "indeed"])
 INCLUDE_REMOTE = os.getenv("INCLUDE_REMOTE", "1").lower() not in {"0", "false", "no"}
+USE_JOBSPY = os.getenv("USE_JOBSPY", "1").lower() not in {"0", "false", "no"}
 MAX_SOURCE_PAGES = max(1, int(os.getenv("MAX_SOURCE_PAGES", "3")))
 MAX_SOURCE_RESULTS = max(25, int(os.getenv("MAX_SOURCE_RESULTS", "75")))
 REQUEST_RETRIES = max(1, int(os.getenv("REQUEST_RETRIES", "3")))
@@ -166,6 +173,11 @@ def canonicalize_url(url: str) -> str:
     if not url:
         return ""
     parsed = urlparse(url)
+    if "indeed.com" in parsed.netloc:
+        query = parse_qs(parsed.query)
+        jk = query.get("jk", [None])[0]
+        if jk:
+            return f"https://www.indeed.com/viewjob?jk={jk}"
     clean = parsed._replace(query="", fragment="")
     return urlunparse(clean).rstrip("/")
 
@@ -189,6 +201,169 @@ def html_to_text(value: str) -> str:
     if not value:
         return ""
     return BeautifulSoup(value, "html.parser").get_text(" ", strip=True)
+
+
+def truncate_text(value: str, limit: int = 3000) -> str:
+    cleaned = re.sub(r"\s+", " ", value or "").strip()
+    return cleaned[:limit]
+
+
+def extract_text_by_selectors(node, selectors: list[str]) -> str:
+    for selector in selectors:
+        match = node.select_one(selector)
+        if match:
+            text = match.get_text(" ", strip=True)
+            if text:
+                return truncate_text(text)
+    return ""
+
+
+def fetch_linkedin_description(url: str) -> str:
+    try:
+        response = request_with_retry(url)
+        soup = BeautifulSoup(response.text, "html.parser")
+        description = extract_text_by_selectors(
+            soup,
+            [
+                ".show-more-less-html__markup",
+                ".description__text",
+                ".jobs-description__content",
+                "[data-test-job-description]",
+            ],
+        )
+        return description
+    except Exception:
+        return ""
+
+
+def fetch_indeed_job_details(driver, url: str, fallback_description: str = "") -> tuple[str, str]:
+    original_handle = driver.current_window_handle
+    original_handles = set(driver.window_handles)
+    final_url = url
+    description = fallback_description
+    try:
+        driver.execute_script("window.open(arguments[0], '_blank');", url)
+        WebDriverWait(driver, 10).until(lambda d: len(d.window_handles) > len(original_handles))
+        new_handle = next(handle for handle in driver.window_handles if handle not in original_handles)
+        driver.switch_to.window(new_handle)
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located(
+                (
+                    By.CSS_SELECTOR,
+                    "#jobDescriptionText, [data-testid='jobsearch-JobComponent-description'], .jobsearch-JobComponent-description",
+                )
+            )
+        )
+        time.sleep(1)
+        final_url = driver.current_url
+        soup = BeautifulSoup(driver.page_source, "html.parser")
+        description = extract_text_by_selectors(
+            soup,
+            [
+                "#jobDescriptionText",
+                "[data-testid='jobsearch-JobComponent-description']",
+                ".jobsearch-JobComponent-description",
+            ],
+        ) or fallback_description
+    except Exception:
+        pass
+    finally:
+        current_handle = driver.current_window_handle
+        if current_handle != original_handle:
+            driver.close()
+            driver.switch_to.window(original_handle)
+    return final_url, description
+
+
+def _jobspy_value(row: dict, *keys):
+    for key in keys:
+        value = row.get(key)
+        if value is not None:
+            return value
+    return None
+
+
+def _jobspy_location_text(row: dict) -> str:
+    location_value = row.get("location")
+    if isinstance(location_value, str) and location_value.strip():
+        return location_value.strip()
+    if isinstance(location_value, dict):
+        city = location_value.get("city")
+        state = location_value.get("state")
+        country = location_value.get("country")
+        parts = [part for part in [city, state, country] if part]
+        if parts:
+            return ", ".join(parts[:2]) if len(parts) >= 2 else parts[0]
+    city = _jobspy_value(row, "city", "location_city")
+    state = _jobspy_value(row, "state", "location_state")
+    country = _jobspy_value(row, "country", "location_country")
+    parts = [str(part).strip() for part in [city, state, country] if part]
+    if parts:
+        return ", ".join(parts[:2]) if len(parts) >= 2 else parts[0]
+    if row.get("is_remote"):
+        return "Remote"
+    return LOCATION
+
+
+def _jobspy_posted_text(value) -> str:
+    if value is None:
+        return "Recent"
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d")
+    return str(value).strip() or "Recent"
+
+
+def _jobspy_source_name(site_name: str) -> str:
+    return {
+        "linkedin": "LinkedIn",
+        "indeed": "Indeed",
+    }.get(site_name.lower(), site_name.title())
+
+
+def fetch_jobspy(keyword: str, site_name: str) -> list[dict]:
+    if not USE_JOBSPY or not jobspy_scrape_jobs:
+        return []
+
+    try:
+        params = {
+            "site_name": [site_name],
+            "search_term": keyword,
+            "location": LOCATION,
+            "distance": RADIUS_MILES,
+            "results_wanted": MAX_SOURCE_RESULTS,
+            "hours_old": 48,
+            "description_format": "markdown",
+            "user_agent": HEADERS["User-Agent"],
+            "verbose": 0,
+        }
+        if site_name == "linkedin":
+            params["linkedin_fetch_description"] = True
+        if site_name == "indeed":
+            params["country_indeed"] = "USA"
+
+        results = jobspy_scrape_jobs(**params)
+        jobs = []
+        for row in results.to_dict("records"):
+            url = _jobspy_value(row, "job_url", "job_url_direct", "url", "job_link") or ""
+            if not url:
+                continue
+            description = truncate_text(str(_jobspy_value(row, "description") or ""))
+            jobs.append(
+                build_job(
+                    title=str(_jobspy_value(row, "title") or "N/A"),
+                    company=str(_jobspy_value(row, "company") or "N/A"),
+                    location=_jobspy_location_text(row),
+                    url=str(url),
+                    source=_jobspy_source_name(site_name),
+                    posted=_jobspy_posted_text(_jobspy_value(row, "date_posted")),
+                    description=description,
+                )
+            )
+        log.info("JobSpy returned %s %s jobs for '%s'.", len(jobs), site_name, keyword)
+        return jobs
+    except Exception as e:
+        log.warning("JobSpy fetch failed for '%s' on %s: %s", keyword, site_name, e)
+        return []
 
 
 def build_job(
@@ -252,7 +427,12 @@ def requires_current_clearance(job: dict) -> bool:
         return False
     if _OBTAINABLE_CLEARANCE_RE.search(text):
         return False
-    if _CURRENT_CLEARANCE_RE.search(text):
+    clearance_phrases = [
+        r"(?:active|current|existing|already hold|must hold|hold an active)\W{0,40}(?:top secret|secret|ts/sci|ts sci|sci|public trust|security clearance|clearance with poly|polygraph|full scope poly)",
+        r"(?:top secret|secret|ts/sci|ts sci|sci|public trust|security clearance|clearance with poly|polygraph|full scope poly)\W{0,40}(?:required at time of hire|day one|prior to start)",
+        r"(?:must have|must possess|possess)\W{0,20}(?:an?\s+)?(?:active|current|existing)?\W{0,20}(?:top secret|secret|ts/sci|ts sci|sci|public trust|security clearance|clearance with poly|polygraph|full scope poly)",
+    ]
+    if any(re.search(pattern, normalized) for pattern in clearance_phrases):
         return True
     return bool(re.search(r"\bmust have\b.*\b(clearance|ts|sci|secret|polygraph)\b", normalized))
 
@@ -353,12 +533,19 @@ def fetch_linkedin(keyword: str) -> list[dict]:
             cards = soup.find_all("li")
             if not cards:
                 break
-            page_added = 0
             for card in cards:
                 title_tag = card.find("h3", class_="base-search-card__title")
                 company_tag = card.find("h4", class_="base-search-card__subtitle")
                 loc_tag = card.find("span", class_="job-search-card__location")
                 link_tag = card.find("a", class_="base-card__full-link")
+                desc_text = extract_text_by_selectors(
+                    card,
+                    [
+                        ".base-search-card__snippet",
+                        ".job-search-card__snippet",
+                        ".base-search-card__metadata",
+                    ],
+                )
                 if title_tag and link_tag:
                     candidate = build_job(
                         title=title_tag.text,
@@ -367,17 +554,17 @@ def fetch_linkedin(keyword: str) -> list[dict]:
                         url=link_tag["href"],
                         source="LinkedIn",
                         posted="Last 24h",
+                        description=desc_text,
                     )
                     url = candidate["url"]
                     if url in seen_urls:
                         continue
+                    if not candidate["description"]:
+                        candidate["description"] = fetch_linkedin_description(url)
                     if not is_relevant_linkedin_job(candidate):
                         continue
                     seen_urls.add(url)
                     jobs.append(candidate)
-                    page_added += 1
-            if page_added == 0:
-                break
     except Exception as e:
         log.warning(f"LinkedIn fetch failed for '{keyword}': {e}")
     return jobs
@@ -641,28 +828,56 @@ def fetch_indeed(keyword: str) -> list[dict]:
             cards = soup.find_all("div", class_="job_seen_beacon")
             if not cards:
                 break
-            page_added = 0
+            page_candidates = []
             for div in cards:
                 title_tag = div.find("h2", class_="jobTitle")
                 comp_tag = div.find("span", {"data-testid": "company-name"})
                 loc_tag = div.find("div", {"data-testid": "text-location"})
                 link_tag = div.find("a", class_="jcs-JobTitle")
+                desc_text = extract_text_by_selectors(
+                    div,
+                    [
+                        "[data-testid='job-snippet']",
+                        ".job-snippet",
+                        ".underShelfFooter span",
+                    ],
+                )
                 if title_tag and link_tag:
-                    url = "https://www.indeed.com" + link_tag["href"]
-                    if url in seen_urls:
+                    raw_url = "https://www.indeed.com" + link_tag["href"]
+                    canonical_seed = canonicalize_url(raw_url)
+                    if canonical_seed in seen_urls:
                         continue
-                    seen_urls.add(url)
-                    jobs.append(build_job(
-                        title=title_tag.text,
-                        company=comp_tag.text if comp_tag else "N/A",
-                        location=loc_tag.text if loc_tag else LOCATION,
-                        url=url,
-                        source="Indeed",
-                        posted="Today",
-                    ))
-                    page_added += 1
-            if page_added == 0:
+                    page_candidates.append(
+                        {
+                            "title": title_tag.text,
+                            "company": comp_tag.text if comp_tag else "N/A",
+                            "location": loc_tag.text if loc_tag else LOCATION,
+                            "url": raw_url,
+                            "description": desc_text,
+                        }
+                    )
+            if not page_candidates:
                 break
+            for candidate in page_candidates:
+                final_url, description = fetch_indeed_job_details(
+                    driver,
+                    candidate["url"],
+                    candidate["description"],
+                )
+                job = build_job(
+                    title=candidate["title"],
+                    company=candidate["company"],
+                    location=candidate["location"],
+                    url=final_url,
+                    source="Indeed",
+                    posted="Today",
+                    description=description,
+                )
+                canonical_url = job["canonical_url"]
+                if canonical_url in seen_urls:
+                    continue
+                seen_urls.add(canonical_url)
+                jobs.append(job)
     except Exception as e:
         log.warning(f"Indeed fetch failed for '{keyword}': {e}")
     finally:
@@ -908,11 +1123,23 @@ def run():
     collect(fetch_greenhouse())
     collect(fetch_lever())
 
+    jobspy_sites = {site.lower() for site in JOBSPY_SITES}
     for kw in KEYWORDS:
         log.info("Searching: '%s'", kw)
-        collect(fetch_linkedin(kw))
+        if "linkedin" in jobspy_sites:
+            linkedin_jobs = fetch_jobspy(kw, "linkedin")
+            collect(linkedin_jobs if linkedin_jobs else fetch_linkedin(kw))
+        else:
+            collect(fetch_linkedin(kw))
+
         collect(fetch_adzuna(kw))
-        collect(fetch_indeed(kw))
+
+        if "indeed" in jobspy_sites:
+            indeed_jobs = fetch_jobspy(kw, "indeed")
+            collect(indeed_jobs if indeed_jobs else fetch_indeed(kw))
+        else:
+            collect(fetch_indeed(kw))
+
         # collect(fetch_mwejobs(kw))
         time.sleep(2)
 

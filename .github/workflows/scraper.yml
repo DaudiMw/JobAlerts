@@ -42,7 +42,7 @@ jobs:
       
       - name: Install Dependencies
         run: |
-          pip install requests beautifulsoup4 selenium webdriver-manager python-dotenv
+          pip install requests beautifulsoup4 selenium webdriver-manager python-dotenv python-jobspy
 
       - name: Run Scraper Script
         env:
