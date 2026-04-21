@@ -11,10 +11,11 @@ import json
 import time
 import logging
 import re
+from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse, urlunparse
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -55,6 +56,34 @@ except json.JSONDecodeError:
 log.info(f"Loaded keywords: {KEYWORDS}")
 
 
+def _load_json_list(env_name: str, fallback: list[str]) -> list[str]:
+    raw = os.getenv(env_name)
+    if not raw:
+        return fallback
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        log.warning("Failed to parse %s; using fallback.", env_name)
+        return fallback
+    if not isinstance(data, list):
+        log.warning("%s must be a JSON list; using fallback.", env_name)
+        return fallback
+    return [str(item).strip() for item in data if str(item).strip()]
+
+
+SEARCH_LOCATIONS = _load_json_list(
+    "SEARCH_LOCATIONS",
+    ["Baltimore, MD", "Columbia, MD", "Washington, DC", "Arlington, VA"],
+)
+GREENHOUSE_BOARDS = _load_json_list("GREENHOUSE_BOARDS", [])
+LEVER_SITES = _load_json_list("LEVER_SITES", [])
+INCLUDE_REMOTE = os.getenv("INCLUDE_REMOTE", "1").lower() not in {"0", "false", "no"}
+MAX_SOURCE_PAGES = max(1, int(os.getenv("MAX_SOURCE_PAGES", "3")))
+MAX_SOURCE_RESULTS = max(25, int(os.getenv("MAX_SOURCE_RESULTS", "75")))
+REQUEST_RETRIES = max(1, int(os.getenv("REQUEST_RETRIES", "3")))
+REQUEST_TIMEOUT = max(5, int(os.getenv("REQUEST_TIMEOUT", "20")))
+
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -62,6 +91,8 @@ HEADERS = {
         "Chrome/120.0.0.0 Safari/537.36"
     )
 }
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
 
 # ── Filters ──────────────────────────────────────────────────────────────────
 
@@ -76,6 +107,91 @@ _EXP_BLOCKLIST = [
     r"\b\w+\s+[II|III|IV|V|VI]+\b",
 ]
 _EXP_RE = re.compile("|".join(_EXP_BLOCKLIST), re.IGNORECASE)
+_ENTRY_PATTERNS = [
+    r"\bentry[\s-]?level\b", r"\bjunior\b", r"\bjr\.?\b", r"\bassociate\b",
+    r"\bnew[\s-]?grad\b", r"\brecent grad(?:uate)?\b", r"\bgraduate\b",
+    r"\bearly career\b", r"\bapprentice\b", r"\b0[\s-]*[–-]?[\s-]*2 years\b",
+    r"\b1[\s-]*[–-]?[\s-]*2 years\b", r"\b0-2 years\b", r"\b1-2 years\b",
+]
+_ENTRY_RE = re.compile("|".join(_ENTRY_PATTERNS), re.IGNORECASE)
+_REMOTE_RE = re.compile(r"\b(remote|work from home|hybrid|distributed|anywhere)\b", re.IGNORECASE)
+
+
+def normalize_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+
+
+def tokenize(value: str) -> set[str]:
+    return {token for token in normalize_text(value).split() if len(token) > 1}
+
+
+def canonicalize_url(url: str) -> str:
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    clean = parsed._replace(query="", fragment="")
+    return urlunparse(clean).rstrip("/")
+
+
+def request_with_retry(url: str, *, params: dict | None = None, headers: dict | None = None) -> requests.Response:
+    last_error = None
+    for attempt in range(1, REQUEST_RETRIES + 1):
+        try:
+            response = SESSION.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            return response
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt == REQUEST_RETRIES:
+                break
+            time.sleep(1.5 * attempt)
+    raise last_error
+
+
+def html_to_text(value: str) -> str:
+    if not value:
+        return ""
+    return BeautifulSoup(value, "html.parser").get_text(" ", strip=True)
+
+
+def build_job(
+    *,
+    title: str,
+    company: str,
+    location: str,
+    url: str,
+    source: str,
+    posted: str,
+    description: str = "",
+) -> dict:
+    return {
+        "title": str(title or "").strip() or "N/A",
+        "company": str(company or "").strip() or "N/A",
+        "location": str(location or "").strip() or LOCATION,
+        "url": str(url or "").strip(),
+        "source": source,
+        "posted": str(posted).strip() if posted else "Recent",
+        "description": str(description or "").strip(),
+        "canonical_url": canonicalize_url(url),
+    }
+
+
+def location_matches(job: dict) -> bool:
+    location_text = " ".join(
+        part for part in [job.get("location", ""), job.get("description", ""), job.get("title", "")] if part
+    )
+    normalized = normalize_text(location_text)
+    if not normalized:
+        return True
+    if INCLUDE_REMOTE and _REMOTE_RE.search(location_text):
+        return True
+    for candidate in SEARCH_LOCATIONS:
+        candidate_tokens = tokenize(candidate)
+        if candidate_tokens and candidate_tokens.issubset(set(normalized.split())):
+            return True
+        if normalize_text(candidate) in normalized:
+            return True
+    return False
 
 def is_entry_level(job: dict) -> bool:
     """Return False if the job title or description signals high experience."""
@@ -89,46 +205,88 @@ def is_entry_level(job: dict) -> bool:
         return False
     return True
 
-def is_related(job: dict) -> bool:
-    """Return True if the job title matches any of the user-provided keywords."""
-    title = job.get("title", "").lower()
+def score_job(job: dict) -> int:
+    title = normalize_text(job.get("title", ""))
+    description = normalize_text(job.get("description", ""))
+    combined = f"{title} {description}".strip()
+    title_tokens = set(title.split())
+    combined_tokens = set(combined.split())
+
+    score = 0
     for kw in KEYWORDS:
-        # Check if the keyword exists as a phrase in the title
-        if kw.lower() in title:
-            return True
-    return False
+        kw_norm = normalize_text(kw)
+        kw_tokens = tokenize(kw)
+        if kw_norm and kw_norm in title:
+            score += 5
+            continue
+        if kw_norm and kw_norm in combined:
+            score += 3
+        overlap_title = len(kw_tokens & title_tokens)
+        overlap_combined = len(kw_tokens & combined_tokens)
+        if kw_tokens and overlap_title >= max(1, len(kw_tokens) - 1):
+            score += 3
+        elif overlap_combined:
+            score += min(2, overlap_combined)
+
+    title_text = job.get("title", "")
+    desc_text = job.get("description", "")
+    if _ENTRY_RE.search(title_text):
+        score += 3
+    elif _ENTRY_RE.search(desc_text):
+        score += 1
+    if location_matches(job):
+        score += 1
+    return score
+
+
+def is_related(job: dict) -> bool:
+    return is_entry_level(job) and score_job(job) >= 4
 
 # ── Scrapers ──────────────────────────────────────────────────────────────────
 
 def fetch_linkedin(keyword: str) -> list[dict]:
     jobs = []
-    params = {
-        "keywords": f"{keyword} entry level OR junior OR associate OR new grad",
-        "location": LOCATION,
-        "distance": RADIUS_MILES,
-        "f_TPR": "r10800",
-        "f_E": "1,2",
-        "start": 0,
-    }
-    url = f"https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search?{urlencode(params)}"
+    seen_urls = set()
     try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        for card in soup.find_all("li"):
-            title_tag   = card.find("h3", class_="base-search-card__title")
-            company_tag = card.find("h4", class_="base-search-card__subtitle")
-            loc_tag     = card.find("span", class_="job-search-card__location")
-            link_tag    = card.find("a", class_="base-card__full-link")
-            if title_tag and link_tag:
-                jobs.append({
-                    "title":    title_tag.text.strip(),
-                    "company":  company_tag.text.strip() if company_tag else "N/A",
-                    "location": loc_tag.text.strip() if loc_tag else LOCATION,
-                    "url":      link_tag["href"],
-                    "source":   "LinkedIn",
-                    "posted":   "Last 3h",
-                })
+        for start in range(0, MAX_SOURCE_RESULTS, 25):
+            params = {
+                "keywords": f"{keyword} entry level OR junior OR associate OR new grad",
+                "location": LOCATION,
+                "distance": RADIUS_MILES,
+                "f_TPR": "r86400",
+                "f_E": "1,2",
+                "start": start,
+            }
+            response = request_with_retry(
+                "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search",
+                params=params,
+            )
+            soup = BeautifulSoup(response.text, "html.parser")
+            cards = soup.find_all("li")
+            if not cards:
+                break
+            page_added = 0
+            for card in cards:
+                title_tag = card.find("h3", class_="base-search-card__title")
+                company_tag = card.find("h4", class_="base-search-card__subtitle")
+                loc_tag = card.find("span", class_="job-search-card__location")
+                link_tag = card.find("a", class_="base-card__full-link")
+                if title_tag and link_tag:
+                    url = link_tag["href"]
+                    if url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    jobs.append(build_job(
+                        title=title_tag.text,
+                        company=company_tag.text if company_tag else "N/A",
+                        location=loc_tag.text if loc_tag else LOCATION,
+                        url=url,
+                        source="LinkedIn",
+                        posted="Last 24h",
+                    ))
+                    page_added += 1
+            if page_added == 0:
+                break
     except Exception as e:
         log.warning(f"LinkedIn fetch failed for '{keyword}': {e}")
     return jobs
@@ -137,31 +295,34 @@ def fetch_adzuna(keyword: str) -> list[dict]:
     jobs = []
     if not ADZUNA_APP_ID or not ADZUNA_APP_KEY:
         return jobs
-    params = {
-        "app_id":           ADZUNA_APP_ID,
-        "app_key":          ADZUNA_APP_KEY,
-        "results_per_page": "25",
-        "what":             f"{keyword} entry level OR junior OR associate OR new grad",
-        "where":            LOCATION,
-        "distance":         str(RADIUS_MILES),
-        "max_days_old":     "1",
-        "sort_by":          "date",
-        "full_time":        "1",
-    }
-    url = "https://api.adzuna.com/v1/api/jobs/us/search/1?" + urlencode(params)
     try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        for job in data.get("results", []):
-            jobs.append({
-                "title":    job.get("title", "N/A"),
-                "company":  job.get("company", {}).get("display_name", "N/A"),
-                "location": job.get("location", {}).get("display_name", LOCATION),
-                "url":      job.get("redirect_url", "#"),
-                "source":   "Adzuna",
-                "posted":   job.get("created", "Today")[:10],
-            })
+        for page in range(1, MAX_SOURCE_PAGES + 1):
+            params = {
+                "app_id": ADZUNA_APP_ID,
+                "app_key": ADZUNA_APP_KEY,
+                "results_per_page": "50",
+                "what": f"{keyword} entry level OR junior OR associate OR new grad",
+                "where": LOCATION,
+                "distance": str(RADIUS_MILES),
+                "max_days_old": "2",
+                "sort_by": "date",
+                "full_time": "1",
+            }
+            response = request_with_retry(f"https://api.adzuna.com/v1/api/jobs/us/search/{page}", params=params)
+            data = response.json()
+            results = data.get("results", [])
+            if not results:
+                break
+            for job in results:
+                jobs.append(build_job(
+                    title=job.get("title", "N/A"),
+                    company=job.get("company", {}).get("display_name", "N/A"),
+                    location=job.get("location", {}).get("display_name", LOCATION),
+                    url=job.get("redirect_url", "#"),
+                    source="Adzuna",
+                    posted=job.get("created", "Today")[:10],
+                    description=job.get("description", ""),
+                ))
     except Exception as e:
         log.warning(f"Adzuna fetch failed for '{keyword}': {e}")
     return jobs
@@ -186,55 +347,45 @@ def fetch_usajobs():
         log.warning("USAJobs: Missing API Key.")
         return jobs
     
-    # Construct broad query
+    headers = {
+        "Host": "data.usajobs.gov",
+        "User-Agent": USAJOBS_USER_AGENT or EMAIL_SENDER or "job_alert_script",
+        "Authorization-Key": USAJOBS_API_KEY.strip(),
+    }
+
     for query in KEYWORDS:
-        
-        # # API format requires specific headers and parameters
-        params = {
-            "Keyword": query,
-            "SecurityClearanceRequired": 0,
-            "LocationName": LOCATION,
-            "Radius": RADIUS_MILES,
-            "DatePosted": 1,
-            "ResultsPerPage": 50,
-        }
-        
-        # # Add JobCategoryCode for IT/Computer Science if any keyword relates to it
-        # if any(kw in query.lower() for kw in ["software", "developer", "engineer", "data", "computer", "it"]):
-        #     params["JobCategoryCode"] = "2210"
-
-        headers = {
-            "Host": "data.usajobs.gov",
-            "User-Agent": USAJOBS_USER_AGENT or EMAIL_SENDER or "job_alert_script",
-            "Authorization-Key": USAJOBS_API_KEY.strip(),
-        }
-        
         try:
-            url = "https://data.usajobs.gov/api/search"
-            r = requests.get(url, headers=headers, params=params, timeout=15)
-            r.raise_for_status()
-            
-            data = r.json()
-            # breakpoint()
-            search_result = data.get("SearchResult", {})
-
-            log.info(f"USAJobs found {search_result.get("SearchResultCount", 0)} jobs.")
-
-            items = search_result.get("SearchResultItems", [])
-            
-            for item in items:
-                j = item.get("MatchedObjectDescriptor", {})
-                jobs.append({
-                    "title":    j.get("PositionTitle", "N/A"),
-                    "company":  j.get("OrganizationName", "N/A"),
-                    "location": j.get("PositionLocationDisplay", LOCATION),
-                    "url":      j.get("PositionURI", "#"),
-                    "source":   "USAJobs",
-                    "posted":   j.get("PublicationStartDate", "")[:10],
-                })
-            log.info(f"USAJobs returned {len(jobs)} jobs.")
+            for page in range(1, MAX_SOURCE_PAGES + 1):
+                params = {
+                    "Keyword": query,
+                    "SecurityClearanceRequired": 0,
+                    "LocationName": LOCATION,
+                    "Radius": RADIUS_MILES,
+                    "DatePosted": 2,
+                    "ResultsPerPage": 100,
+                    "Page": page,
+                }
+                response = request_with_retry("https://data.usajobs.gov/api/search", params=params, headers=headers)
+                data = response.json()
+                search_result = data.get("SearchResult", {})
+                items = search_result.get("SearchResultItems", [])
+                if page == 1:
+                    log.info("USAJobs found %s jobs for '%s'.", search_result.get("SearchResultCount", 0), query)
+                if not items:
+                    break
+                for item in items:
+                    j = item.get("MatchedObjectDescriptor", {})
+                    jobs.append(build_job(
+                        title=j.get("PositionTitle", "N/A"),
+                        company=j.get("OrganizationName", "N/A"),
+                        location=j.get("PositionLocationDisplay", LOCATION),
+                        url=j.get("PositionURI", "#"),
+                        source="USAJobs",
+                        posted=j.get("PublicationStartDate", "")[:10],
+                        description=j.get("UserArea", {}).get("Details", {}).get("JobSummary", ""),
+                    ))
         except Exception as e:
-            log.warning(f"USAJobs fetch failed: {e}")
+            log.warning("USAJobs fetch failed for '%s': %s", query, e)
 
     return jobs
 
@@ -303,12 +454,20 @@ def fetch_handshake() -> list[dict]:
                 if len(lines) >= 2:
                     job_links_data.append({"title": lines[2] if len(lines) >= 3 else lines[1], "company": lines[0], "url": href})
 
-        for job in job_links_data[:10]:
+        for job in job_links_data[: min(MAX_SOURCE_RESULTS, len(job_links_data))]:
             try:
                 driver.get(job["url"])
                 time.sleep(2)
                 desc = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, "[data-hook='job-description'], [class*='description']"))).text
-                candidate = {**job, "location": LOCATION, "source": "Handshake", "posted": "Recent", "description": desc[:3000]}
+                candidate = build_job(
+                    title=job["title"],
+                    company=job["company"],
+                    location=LOCATION,
+                    url=job["url"],
+                    source="Handshake",
+                    posted="Recent",
+                    description=desc[:3000],
+                )
                 if is_entry_level(candidate) and is_related(candidate):
                     jobs.append(candidate)
             except: continue
@@ -330,17 +489,38 @@ def fetch_simplify() -> list[dict]:
         options.add_argument("--no-sandbox")
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=options)
-        driver.get("https://simplify.jobs/l/new-grad-software")
-        time.sleep(5)
-        cards = driver.find_elements(By.CSS_SELECTOR, "a[href*='/jobs/']")
-        for card in cards[:15]:
-            try:
-                text = card.text.split("\n")
-                if len(text) >= 2:
-                    job = {"title": text[0], "company": text[1], "location": LOCATION, "url": card.get_attribute("href"), "source": "Simplify", "posted": "Recent"}
-                    if is_related(job):
-                        jobs.append(job)
-            except: continue
+        targets = [
+            "https://simplify.jobs/l/new-grad-software",
+            "https://simplify.jobs/l/entry-level-software-engineer",
+        ]
+        seen_urls = set()
+        for target in targets:
+            driver.get(target)
+            time.sleep(5)
+            cards = driver.find_elements(By.CSS_SELECTOR, "a[href*='/jobs/']")
+            for card in cards[:MAX_SOURCE_RESULTS]:
+                try:
+                    url = card.get_attribute("href")
+                    if not url or url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    text = [line.strip() for line in card.text.split("\n") if line.strip()]
+                    if len(text) >= 2:
+                        title = text[0]
+                        company = text[1]
+                        location = next((line for line in text[2:] if "," in line or "Remote" in line), LOCATION)
+                        job = build_job(
+                            title=title,
+                            company=company,
+                            location=location,
+                            url=url,
+                            source="Simplify",
+                            posted="Recent",
+                        )
+                        if is_related(job):
+                            jobs.append(job)
+                except:
+                    continue
         log.info(f"Simplify returned {len(jobs)} jobs.")
     except Exception as e:
         log.warning(f"Simplify failed: {e}")
@@ -357,28 +537,102 @@ def fetch_indeed(keyword: str) -> list[dict]:
         options.add_argument(f"user-agent={HEADERS['User-Agent']}")
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=options)
-        params = {"q": f"{keyword} entry level", "l": LOCATION, "radius": RADIUS_MILES, "fromage": "1"}
-        driver.get(f"https://www.indeed.com/jobs?{urlencode(params)}")
-        time.sleep(4)
-        soup = BeautifulSoup(driver.page_source, "html.parser")
-        for div in soup.find_all("div", class_="job_seen_beacon"):
-            title_tag = div.find("h2", class_="jobTitle")
-            comp_tag  = div.find("span", {"data-testid": "company-name"})
-            loc_tag   = div.find("div", {"data-testid": "text-location"})
-            link_tag  = div.find("a", class_="jcs-JobTitle")
-            if title_tag and link_tag:
-                jobs.append({
-                    "title":    title_tag.text.strip(),
-                    "company":  comp_tag.text.strip() if comp_tag else "N/A",
-                    "location": loc_tag.text.strip() if loc_tag else LOCATION,
-                    "url":      "https://www.indeed.com" + link_tag["href"],
-                    "source":   "Indeed",
-                    "posted":   "Today",
-                })
+        seen_urls = set()
+        for start in range(0, MAX_SOURCE_RESULTS, 10):
+            params = {"q": f"{keyword} entry level", "l": LOCATION, "radius": RADIUS_MILES, "fromage": "2", "start": start}
+            driver.get(f"https://www.indeed.com/jobs?{urlencode(params)}")
+            time.sleep(4)
+            soup = BeautifulSoup(driver.page_source, "html.parser")
+            cards = soup.find_all("div", class_="job_seen_beacon")
+            if not cards:
+                break
+            page_added = 0
+            for div in cards:
+                title_tag = div.find("h2", class_="jobTitle")
+                comp_tag = div.find("span", {"data-testid": "company-name"})
+                loc_tag = div.find("div", {"data-testid": "text-location"})
+                link_tag = div.find("a", class_="jcs-JobTitle")
+                if title_tag and link_tag:
+                    url = "https://www.indeed.com" + link_tag["href"]
+                    if url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    jobs.append(build_job(
+                        title=title_tag.text,
+                        company=comp_tag.text if comp_tag else "N/A",
+                        location=loc_tag.text if loc_tag else LOCATION,
+                        url=url,
+                        source="Indeed",
+                        posted="Today",
+                    ))
+                    page_added += 1
+            if page_added == 0:
+                break
     except Exception as e:
         log.warning(f"Indeed fetch failed for '{keyword}': {e}")
     finally:
         if driver: driver.quit()
+    return jobs
+
+
+def fetch_greenhouse() -> list[dict]:
+    jobs = []
+    if not GREENHOUSE_BOARDS:
+        return jobs
+    for board in GREENHOUSE_BOARDS:
+        board_count = 0
+        try:
+            response = request_with_retry(f"https://boards-api.greenhouse.io/v1/boards/{board}/jobs", params={"content": "true"})
+            data = response.json()
+            for job in data.get("jobs", []):
+                jobs.append(build_job(
+                    title=job.get("title", "N/A"),
+                    company=board,
+                    location=job.get("location", {}).get("name", LOCATION),
+                    url=job.get("absolute_url", "#"),
+                    source="Greenhouse",
+                    posted=job.get("updated_at", "")[:10] or "Recent",
+                    description=html_to_text(job.get("content", "")),
+                ))
+                board_count += 1
+            log.info("Greenhouse board '%s' fetched %s jobs.", board, board_count)
+        except Exception as e:
+            log.warning("Greenhouse fetch failed for '%s': %s", board, e)
+    return jobs
+
+
+def fetch_lever() -> list[dict]:
+    jobs = []
+    if not LEVER_SITES:
+        return jobs
+    for site in LEVER_SITES:
+        site_count = 0
+        try:
+            for skip in range(0, MAX_SOURCE_RESULTS, 100):
+                response = request_with_retry(
+                    f"https://api.lever.co/v0/postings/{site}",
+                    params={"mode": "json", "limit": 100, "skip": skip},
+                )
+                listings = response.json()
+                if not listings:
+                    break
+                for job in listings:
+                    categories = job.get("categories", {})
+                    jobs.append(build_job(
+                        title=job.get("text", "N/A"),
+                        company=site,
+                        location=categories.get("location") or " / ".join(categories.get("allLocations", [])) or LOCATION,
+                        url=job.get("hostedUrl") or job.get("applyUrl") or "#",
+                        source="Lever",
+                        posted="Recent",
+                        description=html_to_text(job.get("descriptionPlain", "")) or html_to_text(job.get("description", "")),
+                    ))
+                    site_count += 1
+                if len(listings) < 100:
+                    break
+            log.info("Lever site '%s' fetched %s jobs.", site, site_count)
+        except Exception as e:
+            log.warning("Lever fetch failed for '%s': %s", site, e)
     return jobs
 
 def fetch_mwejobs(keyword: str) -> list[dict]:
@@ -476,11 +730,20 @@ def fetch_mwejobs(keyword: str) -> list[dict]:
 def deduplicate(jobs: list[dict]) -> list[dict]:
     seen, unique = set(), []
     for job in jobs:
-        key = (job["title"].lower().strip(), job["company"].lower().strip())
+        key = (
+            normalize_text(job.get("title", "")),
+            normalize_text(job.get("company", "")),
+            normalize_text(job.get("location", "")),
+            job.get("canonical_url") or canonicalize_url(job.get("url", "")),
+        )
         if key not in seen:
             seen.add(key)
             unique.append(job)
     return unique
+
+
+def summarize_sources(jobs: list[dict]) -> Counter:
+    return Counter(job.get("source", "Unknown") for job in jobs)
 
 def build_email_html(jobs: list[dict]) -> str:
     by_source: dict[str, list] = {}
@@ -533,30 +796,56 @@ def run():
         try:
             with open(out_path, "r") as f:
                 prev_data = json.load(f)
-                last_urls = {j["url"] for j in prev_data if "url" in j}
+                last_urls = {canonicalize_url(j["url"]) for j in prev_data if "url" in j}
         except: pass
 
+    source_stats = defaultdict(lambda: {"fetched": 0, "relevant": 0, "new": 0})
     all_jobs = []
-    # Broad scrapers (Dynamic Queries)
-    all_jobs.extend(fetch_usajobs())
-    all_jobs.extend(fetch_handshake())
-    all_jobs.extend(fetch_simplify())
 
-    # Keyword scrapers
+    def collect(source_jobs: list[dict]) -> None:
+        all_jobs.extend(source_jobs)
+        for source, count in summarize_sources(source_jobs).items():
+            source_stats[source]["fetched"] += count
+
+    collect(fetch_usajobs())
+    collect(fetch_handshake())
+    collect(fetch_simplify())
+    collect(fetch_greenhouse())
+    collect(fetch_lever())
+
     for kw in KEYWORDS:
-        log.info(f"Searching: '{kw}'")
-        all_jobs.extend(fetch_linkedin(kw))
-        all_jobs.extend(fetch_adzuna(kw))
-        all_jobs.extend(fetch_indeed(kw))
-        # all_jobs.extend(fetch_mwejobs(kw))
+        log.info("Searching: '%s'", kw)
+        collect(fetch_linkedin(kw))
+        collect(fetch_adzuna(kw))
+        collect(fetch_indeed(kw))
+        # collect(fetch_mwejobs(kw))
         time.sleep(2)
 
     unique_jobs = deduplicate(all_jobs)
-    # Apply generalized filters
-    filtered_jobs = [j for j in unique_jobs if is_entry_level(j) and is_related(j)]
+    filtered_jobs = [j for j in unique_jobs if is_related(j)]
     
-    new_jobs = [j for j in filtered_jobs if j["url"] not in last_urls]
+    new_jobs = [j for j in filtered_jobs if canonicalize_url(j["url"]) not in last_urls]
     log.info(f"Summary: {len(all_jobs)} found -> {len(filtered_jobs)} relevant/entry -> {len(new_jobs)} new.")
+
+    for source, count in summarize_sources(unique_jobs).items():
+        source_stats[source]["deduped"] = count
+    for source, count in summarize_sources(filtered_jobs).items():
+        source_stats[source]["relevant"] += count
+    for source, count in summarize_sources(new_jobs).items():
+        source_stats[source]["new"] += count
+    for source in sorted(source_stats):
+        stats = source_stats[source]
+        deduped = stats.get("deduped", stats["fetched"])
+        filtered_out = max(0, deduped - stats["relevant"])
+        log.info(
+            "Source %-10s fetched=%-4s deduped=%-4s filtered_out=%-4s relevant=%-4s new=%-4s",
+            source,
+            stats["fetched"],
+            deduped,
+            filtered_out,
+            stats["relevant"],
+            stats["new"],
+        )
 
     # Always send email, even if new_jobs is empty
     send_email(new_jobs)
