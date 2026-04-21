@@ -321,7 +321,13 @@ def _jobspy_source_name(site_name: str) -> str:
 
 
 def fetch_jobspy(keyword: str, site_name: str) -> list[dict]:
-    if not USE_JOBSPY or not jobspy_scrape_jobs:
+    if not USE_JOBSPY:
+        return []
+    if not jobspy_scrape_jobs:
+        log.warning(
+            "JobSpy requested for %s but python-jobspy is not installed in the active interpreter; falling back to native scraper.",
+            site_name,
+        )
         return []
 
     try:
@@ -347,7 +353,7 @@ def fetch_jobspy(keyword: str, site_name: str) -> list[dict]:
             url = _jobspy_value(row, "job_url", "job_url_direct", "url", "job_link") or ""
             if not url:
                 continue
-            description = truncate_text(str(_jobspy_value(row, "description") or ""))
+            description = str(_jobspy_value(row, "description") or "")
             jobs.append(
                 build_job(
                     title=str(_jobspy_value(row, "title") or "N/A"),
@@ -946,10 +952,6 @@ def fetch_lever() -> list[dict]:
     return jobs
 
 def fetch_mwejobs(keyword: str) -> list[dict]:
-
-
-
-    
     jobs = []
     driver = None
     try:
