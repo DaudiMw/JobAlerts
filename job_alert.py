@@ -99,6 +99,9 @@ SESSION.headers.update(HEADERS)
 _EXP_BLOCKLIST = [
     r"\b(?:[2-9]|\d{2,})\+?\s*(?:-?\d+)?\s*(?:years?|yrs?)\b",
     r"\b(?:minimum|min|at least)\s+(?:of\s+)?(?:[2-9]|\d{2,})\s*(?:years?|yrs?)\b",
+    r"\b(?:[2-9]|\d{2,}|two|three|four|five|six|seven|eight|nine|ten)\s*(?:\+|plus)?\s*(?:or more\s+)?(?:years?|yrs?)\s+(?:of\s+)?(?:relevant\s+|professional\s+|related\s+)?experience\b",
+    r"\b(?:requires?|required|seeking)\s+(?:a\s+minimum\s+of\s+)?(?:[2-9]|\d{2,}|two|three|four|five|six|seven|eight|nine|ten)\s*(?:\+|plus)?\s*(?:years?|yrs?)\b",
+    r"\bexperience\s*[:\-]?\s*(?:[2-9]|\d{2,}|two|three|four|five|six|seven|eight|nine|ten)\s*(?:\+|plus)?\s*(?:years?|yrs?)\b",
     r"\bsenior\b", r"\bsr\.\b", r"\bmid[- ]?level\b", r"\bintermediate\b",
     r"\blead\b", r"\bprincipal\b", r"\bstaff\b", r"\barchitect\b",
     r"\bmanager\b", r"\bdirector\b", r"\bhead of\b",
@@ -108,13 +111,47 @@ _EXP_BLOCKLIST = [
 ]
 _EXP_RE = re.compile("|".join(_EXP_BLOCKLIST), re.IGNORECASE)
 _ENTRY_PATTERNS = [
-    r"\bentry[\s-]?level\b", r"\bjunior\b", r"\bjr\.?\b", r"\bassociate\b",
+    r"\bentry[\s-]?level\b", r"\bjunior\b", r"\bjr\.?\b",
     r"\bnew[\s-]?grad\b", r"\brecent grad(?:uate)?\b", r"\bgraduate\b",
     r"\bearly career\b", r"\bapprentice\b", r"\b0[\s-]*[–-]?[\s-]*2 years\b",
     r"\b1[\s-]*[–-]?[\s-]*2 years\b", r"\b0-2 years\b", r"\b1-2 years\b",
 ]
 _ENTRY_RE = re.compile("|".join(_ENTRY_PATTERNS), re.IGNORECASE)
 _REMOTE_RE = re.compile(r"\b(remote|work from home|hybrid|distributed|anywhere)\b", re.IGNORECASE)
+_LINKEDIN_TITLE_BLOCKLIST = re.compile(
+    r"\b("
+    r"sales associate|retail associate|campus retail|cashier|barista|"
+    r"waiter|waitress|hostess?|customer service (?:representative|associate)|"
+    r"field service technician|installer|mechanic|warehouse associate|"
+    r"merchandis(?:er|ing)|brand ambassador|store manager|seasonal sales|"
+    r"business development representative|recruiter"
+    r")\b",
+    re.IGNORECASE,
+)
+_CLEARANCE_LEVEL_RE = re.compile(
+    r"\b("
+    r"top secret|secret|ts/sci|ts sci|sci|public trust|"
+    r"security clearance|clearance with poly|polygraph|full scope poly"
+    r")\b",
+    re.IGNORECASE,
+)
+_CURRENT_CLEARANCE_RE = re.compile(
+    r"\b("
+    r"active|current|existing|already hold|must hold|hold an active|"
+    r"possess|must possess|required at time of hire|day one|"
+    r"prior to start|eligible for access on day one"
+    r")\b",
+    re.IGNORECASE,
+)
+_OBTAINABLE_CLEARANCE_RE = re.compile(
+    r"\b("
+    r"able to obtain|ability to obtain|eligible to obtain|"
+    r"can obtain|must obtain|obtain and maintain|"
+    r"obtain a|obtain an|become eligible for|"
+    r"willing to undergo"
+    r")\b",
+    re.IGNORECASE,
+)
 
 
 def normalize_text(value: str) -> str:
@@ -205,6 +242,20 @@ def is_entry_level(job: dict) -> bool:
         return False
     return True
 
+
+def requires_current_clearance(job: dict) -> bool:
+    text = " ".join(
+        part for part in [job.get("title", ""), job.get("description", ""), job.get("location", "")] if part
+    )
+    normalized = normalize_text(text)
+    if not normalized or not _CLEARANCE_LEVEL_RE.search(text):
+        return False
+    if _OBTAINABLE_CLEARANCE_RE.search(text):
+        return False
+    if _CURRENT_CLEARANCE_RE.search(text):
+        return True
+    return bool(re.search(r"\bmust have\b.*\b(clearance|ts|sci|secret|polygraph)\b", normalized))
+
 def score_job(job: dict) -> int:
     title = normalize_text(job.get("title", ""))
     description = normalize_text(job.get("description", ""))
@@ -240,7 +291,44 @@ def score_job(job: dict) -> int:
 
 
 def is_related(job: dict) -> bool:
-    return is_entry_level(job) and score_job(job) >= 4
+    return (
+        is_entry_level(job)
+        and not requires_current_clearance(job)
+        and score_job(job) >= 4
+    )
+
+
+def is_relevant_linkedin_job(job: dict) -> bool:
+    title = job.get("title", "")
+    description = job.get("description", "")
+    if _LINKEDIN_TITLE_BLOCKLIST.search(f"{title} {description}"):
+        return False
+    return is_related(job)
+
+
+def is_recent_graduate_usajobs_item(item: dict) -> bool:
+    descriptor = item.get("MatchedObjectDescriptor", {})
+    details = descriptor.get("UserArea", {}).get("Details", {})
+    hiring_paths = details.get("HiringPath", [])
+
+    for path in hiring_paths if isinstance(hiring_paths, list) else []:
+        name = ""
+        code = ""
+        if isinstance(path, dict):
+            name = str(path.get("Name", ""))
+            code = str(path.get("Code", ""))
+        else:
+            name = str(path)
+        normalized = normalize_text(f"{name} {code}")
+        if "recent graduate" in normalized or "graduates" in normalized:
+            return True
+
+    text_fields = [
+        descriptor.get("QualificationSummary", ""),
+        details.get("JobSummary", ""),
+        details.get("WhoMayApply", ""),
+    ]
+    return any("recent graduate" in normalize_text(value) for value in text_fields if value)
 
 # ── Scrapers ──────────────────────────────────────────────────────────────────
 
@@ -272,18 +360,21 @@ def fetch_linkedin(keyword: str) -> list[dict]:
                 loc_tag = card.find("span", class_="job-search-card__location")
                 link_tag = card.find("a", class_="base-card__full-link")
                 if title_tag and link_tag:
-                    url = link_tag["href"]
-                    if url in seen_urls:
-                        continue
-                    seen_urls.add(url)
-                    jobs.append(build_job(
+                    candidate = build_job(
                         title=title_tag.text,
                         company=company_tag.text if company_tag else "N/A",
                         location=loc_tag.text if loc_tag else LOCATION,
-                        url=url,
+                        url=link_tag["href"],
                         source="LinkedIn",
                         posted="Last 24h",
-                    ))
+                    )
+                    url = candidate["url"]
+                    if url in seen_urls:
+                        continue
+                    if not is_relevant_linkedin_job(candidate):
+                        continue
+                    seen_urls.add(url)
+                    jobs.append(candidate)
                     page_added += 1
             if page_added == 0:
                 break
@@ -358,10 +449,12 @@ def fetch_usajobs():
             for page in range(1, MAX_SOURCE_PAGES + 1):
                 params = {
                     "Keyword": query,
+                    "HiringPath": "graduates",
                     "SecurityClearanceRequired": 0,
                     "LocationName": LOCATION,
                     "Radius": RADIUS_MILES,
                     "DatePosted": 2,
+                    "Fields": "Full",
                     "ResultsPerPage": 100,
                     "Page": page,
                 }
@@ -374,6 +467,8 @@ def fetch_usajobs():
                 if not items:
                     break
                 for item in items:
+                    if not is_recent_graduate_usajobs_item(item):
+                        continue
                     j = item.get("MatchedObjectDescriptor", {})
                     jobs.append(build_job(
                         title=j.get("PositionTitle", "N/A"),
