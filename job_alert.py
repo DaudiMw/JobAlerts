@@ -203,6 +203,19 @@ def html_to_text(value: str) -> str:
     return BeautifulSoup(value, "html.parser").get_text(" ", strip=True)
 
 
+def normalize_description_text(value: str) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    text = html_to_text(text)
+    text = re.sub(r"[*_`#>\[\]\(\)]", " ", text)
+    text = re.sub(r"(?<=\d)\s*[/\\|:;,_-]{1,}\s*(?=\+)", "", text)
+    text = re.sub(r"(?<=\d)\s*\+\s*(?=(?:years?|yrs?))", "+ ", text)
+    text = re.sub(r"[/\\|]{2,}", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def truncate_text(value: str, limit: int = 3000) -> str:
     cleaned = re.sub(r"\s+", " ", value or "").strip()
     return cleaned[:limit]
@@ -382,6 +395,7 @@ def build_job(
     posted: str,
     description: str = "",
 ) -> dict:
+    raw_description = str(description or "").strip()
     return {
         "title": str(title or "").strip() or "N/A",
         "company": str(company or "").strip() or "N/A",
@@ -389,7 +403,8 @@ def build_job(
         "url": str(url or "").strip(),
         "source": source,
         "posted": str(posted).strip() if posted else "Recent",
-        "description": str(description or "").strip(),
+        "description": normalize_description_text(raw_description),
+        "description_raw": raw_description,
         "canonical_url": canonicalize_url(url),
     }
 
