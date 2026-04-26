@@ -103,20 +103,33 @@ SESSION.headers.update(HEADERS)
 
 # ── Filters ──────────────────────────────────────────────────────────────────
 
+_NUMBER_WORD_PATTERN = r"(?:three|four|five|six|seven|eight|nine|ten|eleven|twelve)"
+_YEARS_PATTERN = rf"(?:[3-9]|\d{{2,}}|{_NUMBER_WORD_PATTERN})"
+_TWO_YEARS_PATTERN = r"(?:2|two)"
+
 _EXP_BLOCKLIST = [
-    r"\b(?:[2-9]|\d{2,})\+?\s*(?:-?\d+)?\s*(?:years?|yrs?)\b",
-    r"\b(?:minimum|min|at least)\s+(?:of\s+)?(?:[2-9]|\d{2,})\s*(?:years?|yrs?)\b",
-    r"\b(?:[2-9]|\d{2,}|two|three|four|five|six|seven|eight|nine|ten)\s*(?:\+|plus)?\s*(?:or more\s+)?(?:years?|yrs?)\s+(?:of\s+)?(?:relevant\s+|professional\s+|related\s+)?experience\b",
-    r"\b(?:requires?|required|seeking)\s+(?:a\s+minimum\s+of\s+)?(?:[2-9]|\d{2,}|two|three|four|five|six|seven|eight|nine|ten)\s*(?:\+|plus)?\s*(?:years?|yrs?)\b",
-    r"\bexperience\s*[:\-]?\s*(?:[2-9]|\d{2,}|two|three|four|five|six|seven|eight|nine|ten)\s*(?:\+|plus)?\s*(?:years?|yrs?)\b",
-    r"\bsenior\b", r"\bsr\.\b", r"\bmid[- ]?level\b", r"\bintermediate\b",
+    rf"\b{_YEARS_PATTERN}\s*(?:\+|plus)?\s*(?:years?|yrs?)\b",
+    rf"\b{_YEARS_PATTERN}\s*(?:\+|plus)?\s*(?:-|to)\s*(?:{_YEARS_PATTERN})\s*(?:years?|yrs?)\b",
+    rf"\b(?:minimum|min|at least|at minimum|over|more than)\s+(?:of\s+)?{_YEARS_PATTERN}\s*(?:\+|plus)?\s*(?:years?|yrs?)\b",
+    rf"\b{_YEARS_PATTERN}\s*(?:\+|plus)?\s*(?:or more\s+)?(?:years?|yrs?)\s+(?:of\s+)?(?:relevant\s+|professional\s+|related\s+|industry\s+|hands[- ]on\s+)?experience\b",
+    rf"\b(?:requires?|required|seeking|needs?)\b.{0,40}\b{_YEARS_PATTERN}\s*(?:\+|plus)?\s*(?:years?|yrs?)\b",
+    rf"\bexperience\s*[:\-]?\s*{_YEARS_PATTERN}\s*(?:\+|plus)?\s*(?:years?|yrs?)\b",
+    rf"\b(?:minimum|min)\s+qualifications?\b.{0,80}\b{_YEARS_PATTERN}\s*(?:\+|plus)?\s*(?:years?|yrs?)\b",
+    rf"\b{_TWO_YEARS_PATTERN}\s*(?:\+|plus)\s*(?:years?|yrs?)\b",
+    rf"\b{_TWO_YEARS_PATTERN}\s*(?:-|to)\s*(?:[3-9]|\d{{2,}}|{_NUMBER_WORD_PATTERN})\s*(?:years?|yrs?)\b",
+    rf"\b(?:minimum|min|at least|at minimum|over|more than)\s+(?:of\s+)?{_TWO_YEARS_PATTERN}\s*(?:years?|yrs?)\b",
+]
+_NON_ENTRY_TITLE_PATTERNS = [
+    r"\bsenior\b", r"\bsr\.?\b", r"\bmid[- ]?level\b", r"\bintermediate\b",
     r"\blead\b", r"\bprincipal\b", r"\bstaff\b", r"\barchitect\b",
     r"\bmanager\b", r"\bdirector\b", r"\bhead of\b",
-    # Generalized Level indicators (Level II, Grade 3, etc.)
-    r"\b(?:level|grade|tier|sde|swe|ds)\s*[2-9]\b",
-    r"\b\w+\s+[II|III|IV|V|VI]+\b",
+    r"\b(?:level|lvl|grade|tier)\s*(?:ii|iii|iv|v|vi|2|3|4|5|6)\b",
+    r"\b(?:software|data|product|security|systems|devops|machine learning|ml|backend|front[- ]end|full[- ]stack)?\s*"
+    r"(?:engineer|developer|analyst|scientist|administrator|specialist|consultant|designer|programmer|swe|sde)"
+    r"\s*(?:ii|iii|iv|v|vi|2|3|4|5|6)\b",
 ]
 _EXP_RE = re.compile("|".join(_EXP_BLOCKLIST), re.IGNORECASE)
+_NON_ENTRY_TITLE_RE = re.compile("|".join(_NON_ENTRY_TITLE_PATTERNS), re.IGNORECASE)
 _ENTRY_PATTERNS = [
     r"\bentry[\s-]?level\b", r"\bjunior\b", r"\bjr\.?\b",
     r"\bnew[\s-]?grad\b", r"\brecent grad(?:uate)?\b", r"\bgraduate\b",
@@ -219,6 +232,58 @@ def normalize_description_text(value: str) -> str:
 def truncate_text(value: str, limit: int = 3000) -> str:
     cleaned = re.sub(r"\s+", " ", value or "").strip()
     return cleaned[:limit]
+
+
+def flatten_text_fragments(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        return [text] if text else []
+    if isinstance(value, dict):
+        parts = []
+        for key, item in value.items():
+            if normalize_text(str(key)) in {
+                "url",
+                "urls",
+                "uri",
+                "link",
+                "links",
+                "apply uri",
+                "position uri",
+                "job url",
+                "job url direct",
+                "canonical url",
+            }:
+                continue
+            parts.extend(flatten_text_fragments(item))
+        return parts
+    if isinstance(value, (list, tuple, set)):
+        parts = []
+        for item in value:
+            parts.extend(flatten_text_fragments(item))
+        return parts
+    return [str(value)]
+
+
+def build_search_context(extra_text) -> str:
+    if not extra_text:
+        return ""
+    combined = " ".join(flatten_text_fragments(extra_text))
+    return truncate_text(normalize_description_text(combined), limit=8000)
+
+
+def collect_job_text(job: dict) -> str:
+    parts = [
+        job.get("title", ""),
+        job.get("company", ""),
+        job.get("location", ""),
+        job.get("description", ""),
+        job.get("description_raw", ""),
+        job.get("search_context", ""),
+    ]
+    combined = " ".join(part for part in parts if part)
+    return truncate_text(normalize_description_text(combined), limit=12000)
 
 
 def extract_text_by_selectors(node, selectors: list[str]) -> str:
@@ -376,6 +441,7 @@ def fetch_jobspy(keyword: str, site_name: str) -> list[dict]:
                     source=_jobspy_source_name(site_name),
                     posted=_jobspy_posted_text(_jobspy_value(row, "date_posted")),
                     description=description,
+                    extra_text=row,
                 )
             )
         log.info("JobSpy returned %s %s jobs for '%s'.", len(jobs), site_name, keyword)
@@ -394,6 +460,7 @@ def build_job(
     source: str,
     posted: str,
     description: str = "",
+    extra_text=None,
 ) -> dict:
     raw_description = str(description or "").strip()
     return {
@@ -405,6 +472,7 @@ def build_job(
         "posted": str(posted).strip() if posted else "Recent",
         "description": normalize_description_text(raw_description),
         "description_raw": raw_description,
+        "search_context": build_search_context(extra_text),
         "canonical_url": canonicalize_url(url),
     }
 
@@ -427,22 +495,18 @@ def location_matches(job: dict) -> bool:
     return False
 
 def is_entry_level(job: dict) -> bool:
-    """Return False if the job title or description signals high experience."""
+    """Return False if any fetched job text signals non-entry-level seniority."""
     title = job.get("title", "")
-    description = job.get("description", "")
-    text = f"{title} {description}"
+    text = collect_job_text(job)
     if _EXP_RE.search(text):
         return False
-    lower_title = title.lower()
-    if any(word in lower_title for word in ["senior", "lead", "staff", "principal", "sr."]):
+    if _NON_ENTRY_TITLE_RE.search(title):
         return False
     return True
 
 
 def requires_current_clearance(job: dict) -> bool:
-    text = " ".join(
-        part for part in [job.get("title", ""), job.get("description", ""), job.get("location", "")] if part
-    )
+    text = collect_job_text(job)
     normalized = normalize_text(text)
     if not normalized or not _CLEARANCE_LEVEL_RE.search(text):
         return False
@@ -459,7 +523,7 @@ def requires_current_clearance(job: dict) -> bool:
 
 def score_job(job: dict) -> int:
     title = normalize_text(job.get("title", ""))
-    description = normalize_text(job.get("description", ""))
+    description = normalize_text(collect_job_text(job))
     combined = f"{title} {description}".strip()
     title_tokens = set(title.split())
     combined_tokens = set(combined.split())
@@ -481,7 +545,7 @@ def score_job(job: dict) -> int:
             score += min(2, overlap_combined)
 
     title_text = job.get("title", "")
-    desc_text = job.get("description", "")
+    desc_text = collect_job_text(job)
     if _ENTRY_RE.search(title_text):
         score += 3
     elif _ENTRY_RE.search(desc_text):
@@ -531,6 +595,21 @@ def is_recent_graduate_usajobs_item(item: dict) -> bool:
     ]
     return any("recent graduate" in normalize_text(value) for value in text_fields if value)
 
+
+def build_usajobs_search_context(item: dict) -> dict:
+    descriptor = item.get("MatchedObjectDescriptor", {})
+    details = descriptor.get("UserArea", {}).get("Details", {})
+    return {
+        "title": descriptor.get("PositionTitle", ""),
+        "organization": descriptor.get("OrganizationName", ""),
+        "qualification_summary": descriptor.get("QualificationSummary", ""),
+        "job_summary": details.get("JobSummary", ""),
+        "major_duties": details.get("MajorDuties", ""),
+        "requirements": details.get("Requirements", ""),
+        "evaluations": details.get("Evaluations", ""),
+        "how_you_will_be_evaluated": details.get("HowYouWillBeEvaluated", ""),
+    }
+
 # ── Scrapers ──────────────────────────────────────────────────────────────────
 
 def fetch_linkedin(keyword: str) -> list[dict]:
@@ -576,6 +655,7 @@ def fetch_linkedin(keyword: str) -> list[dict]:
                         source="LinkedIn",
                         posted="Last 24h",
                         description=desc_text,
+                        extra_text=card.get_text(" ", strip=True),
                     )
                     url = candidate["url"]
                     if url in seen_urls:
@@ -621,6 +701,7 @@ def fetch_adzuna(keyword: str) -> list[dict]:
                     source="Adzuna",
                     posted=job.get("created", "Today")[:10],
                     description=job.get("description", ""),
+                    extra_text=job,
                 ))
     except Exception as e:
         log.warning(f"Adzuna fetch failed for '{keyword}': {e}")
@@ -686,6 +767,7 @@ def fetch_usajobs():
                         source="USAJobs",
                         posted=j.get("PublicationStartDate", "")[:10],
                         description=j.get("UserArea", {}).get("Details", {}).get("JobSummary", ""),
+                        extra_text=build_usajobs_search_context(item),
                     ))
         except Exception as e:
             log.warning("USAJobs fetch failed for '%s': %s", query, e)
@@ -770,6 +852,7 @@ def fetch_handshake() -> list[dict]:
                     source="Handshake",
                     posted="Recent",
                     description=desc[:3000],
+                    extra_text=job,
                 )
                 if is_entry_level(candidate) and is_related(candidate):
                     jobs.append(candidate)
@@ -819,6 +902,7 @@ def fetch_simplify() -> list[dict]:
                             url=url,
                             source="Simplify",
                             posted="Recent",
+                            extra_text=text,
                         )
                         if is_related(job):
                             jobs.append(job)
@@ -893,6 +977,7 @@ def fetch_indeed(keyword: str) -> list[dict]:
                     source="Indeed",
                     posted="Today",
                     description=description,
+                    extra_text=candidate,
                 )
                 canonical_url = job["canonical_url"]
                 if canonical_url in seen_urls:
@@ -924,6 +1009,7 @@ def fetch_greenhouse() -> list[dict]:
                     source="Greenhouse",
                     posted=job.get("updated_at", "")[:10] or "Recent",
                     description=html_to_text(job.get("content", "")),
+                    extra_text=job,
                 ))
                 board_count += 1
             log.info("Greenhouse board '%s' fetched %s jobs.", board, board_count)
@@ -957,6 +1043,7 @@ def fetch_lever() -> list[dict]:
                         source="Lever",
                         posted="Recent",
                         description=html_to_text(job.get("descriptionPlain", "")) or html_to_text(job.get("description", "")),
+                        extra_text=job,
                     ))
                     site_count += 1
                 if len(listings) < 100:
